@@ -26,6 +26,7 @@ import "net"
 import "sync"
 import "time"
 import "io"
+import . "github.com/RokyErickson/channels"
 
 // ChanError implements the error and net.Error interfaces.
 type ChanError struct {
@@ -67,7 +68,8 @@ var (
 	// ErrListenQFull is reported if the listen backlog (default 32)
 	// is exhausted.  This normally occurs if a server goroutine does
 	// not call Accept often enough.
-	ErrListenQFull = &ChanError{err: "Listen queue full.", tmp: true}
+	//ErrListenQFull = &ChanError{err: "Listen queue full.", tmp: true}
+	//Infinite Channel Now.
 
 	// ErrConnClosed is reported when a peer closes the connection while
 	// trying to establish the connection or send data.
@@ -114,8 +116,8 @@ func (a *ChanAddr) Network() string {
 // using a pair of cross-connected go channels. This provides net.Conn
 // semantics on top of channels.
 type ChanConn struct {
-	fifo      chan []byte
-	fin       chan bool
+	fifo      Channel //byte
+	fin       Channel //bool
 	rdeadline time.Time
 	wdeadline time.Time
 	peer      *ChanConn
@@ -126,13 +128,13 @@ type ChanConn struct {
 
 type chanConnect struct {
 	conn      *ChanConn
-	connected chan bool
+	connected Channel //bool
 }
 
 // ChanListener is used to listen to a socket.
 type ChanListener struct {
 	name     string
-	connect  chan *chanConnect
+	connect  Channel //*chanConnect
 	deadline time.Time
 }
 
@@ -153,7 +155,7 @@ func ListenChan(name string) (*ChanListener, error) {
 	listener := new(ChanListener)
 	listener.name = name
 	// The listen backlog we support.. fairly arbitrary
-	listener.connect = make(chan *chanConnect, 32)
+	listener.connect = NewInfiniteChannel()
 	// Register listener on the service point
 	listeners.lst[name] = listener
 	return listener, nil
@@ -166,14 +168,15 @@ func (listener *ChanListener) AcceptChan() (*ChanConn, error) {
 	deadline := mkTimer(listener.deadline)
 
 	select {
-	case connect := <-listener.connect:
+	case conn := <-listener.connect.Out():
+		connect := conn.(*chanConnect)
 		// Make a pair of channels, and twist them.  We keep
 		// the first pair, client gets the twisted pair.
 		// We support buffering up to 10 messages for efficiency
-		chan1 := make(chan []byte, 10)
-		chan2 := make(chan []byte, 10)
-		fin1 := make(chan bool)
-		fin2 := make(chan bool)
+		chan1 := NewNativeChannel(10)
+		chan2 := NewNativeChannel(10)
+		fin1 := NewNativeChannel(0)
+		fin2 := NewNativeChannel(0)
 		addr := &ChanAddr{name: listener.name}
 		server := &ChanConn{fifo: chan1, fin: fin1, addr: addr}
 		client := &ChanConn{fifo: chan2, fin: fin2, addr: addr}
@@ -181,7 +184,7 @@ func (listener *ChanListener) AcceptChan() (*ChanConn, error) {
 		client.peer = server
 		// And send the client its info, and a wakeup
 		connect.conn = client
-		connect.connected <- true
+		connect.connected.In() <- true
 		return server, nil
 
 	case <-deadline:
@@ -212,7 +215,7 @@ func DialChan(name string) (*ChanConn, error) {
 	// TBD: This deadline is rather arbitrary
 	deadline := time.After(time.Second * 10)
 	creq := &chanConnect{conn: nil}
-	creq.connected = make(chan bool)
+	creq.connected = NewNativeChannel(0)
 
 	// Note: We assume the buffering is sufficient.  If the server
 	// side cannot keep up with connect requests, then we'll fail.  The
@@ -220,15 +223,10 @@ func DialChan(name string) (*ChanConn, error) {
 	// listen backlog, this should only happen if lots of clients try to
 	// connect too fast.  In TCP world if this happens it becomes
 	// ECONNREFUSED.  We use ErrListenQFull.
-	select {
-	case listener.connect <- creq:
-
-	default:
-		return nil, ErrListenQFull
-	}
+	listener.connect.In() <- creq
 
 	select {
-	case _, ok := <-creq.connected:
+	case _, ok := <-creq.connected.Out():
 		if !ok {
 			return nil, ErrConnClosed
 		}
@@ -254,7 +252,7 @@ func (conn *ChanConn) Close() error {
 // notification is sent to the peer, to begin an orderly shutdown of the
 // connection.  No further data may be read from the connection.
 func (conn *ChanConn) CloseRead() error {
-	close(conn.fin)
+	conn.fin.Close()
 	conn.closed = true
 	return nil
 }
@@ -262,7 +260,7 @@ func (conn *ChanConn) CloseRead() error {
 // CloseWrite closes the write side of the channel.  After this point, it
 // is illegal to write data on the connection.
 func (conn *ChanConn) CloseWrite() error {
-	close(conn.fifo)
+	conn.fifo.Close()
 	return nil
 }
 
@@ -306,7 +304,8 @@ func (conn *ChanConn) Read(b []byte) (int, error) {
 		if conn.pending == nil || len(conn.pending) == 0 {
 			timer := mkTimer(conn.rdeadline)
 			select {
-			case msg := <-conn.peer.fifo:
+			case messages := <-conn.peer.fifo.Out():
+				msg := messages.([]byte)
 				if msg != nil {
 					conn.pending = msg
 				} else if len(b) > 0 {
@@ -354,11 +353,11 @@ func (conn *ChanConn) Write(b []byte) (int, error) {
 	n := len(b)
 
 	select {
-	case <-conn.peer.fin:
+	case <-conn.peer.fin.Out():
 		// Remote close
 		return n, ErrConnClosed
 
-	case conn.fifo <- b:
+	case conn.fifo.In() <- b:
 		// Sent it
 		return n, nil
 
